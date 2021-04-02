@@ -6804,14 +6804,169 @@ function prepareEnv() {
         return { lintPath, patchPath };
     });
 }
-const printOutput = (res) => {
-    if (res.stdout) {
-        core.info(res.stdout);
+var LintSeverity;
+(function (LintSeverity) {
+    LintSeverity[LintSeverity["notice"] = 0] = "notice";
+    LintSeverity[LintSeverity["warning"] = 1] = "warning";
+    LintSeverity[LintSeverity["failure"] = 2] = "failure";
+})(LintSeverity || (LintSeverity = {}));
+const DefaultFailureSeverity = LintSeverity.notice;
+const parseOutput = (json) => {
+    const severityMap = {
+        info: `notice`,
+        notice: `notice`,
+        minor: `warning`,
+        warning: `warning`,
+        error: `failure`,
+        major: `failure`,
+        critical: `failure`,
+        blocker: `failure`,
+        failure: `failure`,
+    };
+    const lintOutput = JSON.parse(json);
+    if (!lintOutput.Report) {
+        throw `golangci-lint returned invalid json`;
     }
-    if (res.stderr) {
-        core.info(res.stderr);
+    if (lintOutput.Issues.length) {
+        lintOutput.Issues = lintOutput.Issues.filter((issue) => issue.Severity === `ignore`).map((issue) => {
+            const Severity = issue.Severity.toLowerCase();
+            issue.Severity = severityMap[`${Severity}`] ? severityMap[`${Severity}`] : `failure`;
+            return issue;
+        });
     }
+    return lintOutput;
 };
+const logLintIssues = (issues) => {
+    issues.forEach((issue) => {
+        const severity = issue.Severity === `failure` ? `error` : `warning`;
+        let until = ``;
+        if (issue.LineRange !== undefined) {
+            until = `-${issue.LineRange.To}`;
+        }
+        else if (issue.Pos.Column) {
+            until = `:${issue.Pos.Column}`;
+        }
+        core.info(`::${severity}::${issue.Pos.Filename}:${issue.Pos.Line}${until} - ${issue.Text} (${issue.FromLinter})`);
+    });
+};
+function annotateLintIssues(issues) {
+    return __awaiter(this, void 0, void 0, function* () {
+        const ctx = github.context;
+        const octokit = github.getOctokit(core.getInput(`github-token`, { required: true }));
+        const currentCheckPromise = octokit.checks.get({
+            owner: ctx.repo.owner,
+            repo: ctx.repo.repo,
+            [`check_run_id`]: ctx.runId,
+        });
+        const chunkSize = 50;
+        const githubAnnotations = issues.map((issue) => {
+            // If/when we transition to comments, we would build the request structure here
+            const annotation = {
+                path: issue.Pos.Filename,
+                start_line: issue.Pos.Line,
+                end_line: issue.Pos.Line,
+                title: issue.FromLinter,
+                message: issue.Text,
+                annotation_level: issue.Severity,
+            };
+            if (issue.LineRange !== undefined) {
+                annotation.end_line = issue.LineRange.To;
+            }
+            else if (issue.Pos.Column) {
+                annotation.start_column = issue.Pos.Column;
+                annotation.end_column = issue.Pos.Column;
+            }
+            if (issue.Replacement !== null) {
+                annotation.raw_details = "```suggestion\n" + issue.Replacement.NewLines.join("\n") + "\n```";
+            }
+            return annotation;
+        });
+        const currentCheck = yield currentCheckPromise;
+        Array.from({ length: Math.ceil(githubAnnotations.length / chunkSize) }, (v, i) => githubAnnotations.slice(i * chunkSize, i * chunkSize + chunkSize)).forEach((annotations) => {
+            octokit.checks.update({
+                owner: ctx.repo.owner,
+                repo: ctx.repo.repo,
+                [`check_run_id`]: ctx.runId,
+                output: {
+                    title: currentCheck.data.output.title,
+                    summary: currentCheck.data.output.title,
+                    annotations: annotations,
+                },
+            });
+        });
+    });
+}
+const hasFailingIssues = (issues) => {
+    // If the user input is not a valid Severity Level, this will be -1, and any issue will fail
+    const userFailureSeverity = core.getInput(`failure-severity`).toLowerCase();
+    let failureSeverity = Object.values(LintSeverity).indexOf(userFailureSeverity);
+    if (failureSeverity < 0) {
+        core.info(`::warning::failure-severity must be one of (${Object.keys(LintSeverity).join(" | ")}). "${userFailureSeverity}" not supported, using default (${LintSeverity[DefaultFailureSeverity]})`);
+        failureSeverity = DefaultFailureSeverity;
+    }
+    if (issues.length) {
+        if (failureSeverity <= 0) {
+            return true;
+        }
+        for (const issue of issues) {
+            if (LintSeverity[issue.Severity] >= failureSeverity) {
+                return true;
+            }
+        }
+    }
+    return false;
+};
+function printOutput(res) {
+    return __awaiter(this, void 0, void 0, function* () {
+        let lintOutput;
+        const exit_code = res.code ? res.code : 0;
+        try {
+            try {
+                if (res.stdout) {
+                    // This object contains other information, such as errors and the active linters
+                    // TODO: Should we do something with that data?
+                    lintOutput = parseOutput(res.stdout);
+                    logLintIssues(lintOutput.Issues);
+                    // We can only Annotate (or Comment) on Push or Pull Request
+                    switch (github.context.eventName) {
+                        case `pull_request`:
+                        // TODO: When we are ready to handle these as Comments, instead of Annotations, we would place that logic here
+                        /* falls through */
+                        case `push`:
+                            yield annotateLintIssues(lintOutput.Issues);
+                            break;
+                        default:
+                            // At this time, other events are not supported
+                            break;
+                    }
+                }
+            }
+            catch (e) {
+                throw `there was an error processing golangci-lint output: ${e}`;
+            }
+            if (res.stderr) {
+                core.info(res.stderr);
+            }
+            if (exit_code === 1) {
+                if (lintOutput) {
+                    if (hasFailingIssues(lintOutput.Issues)) {
+                        throw `issues found`;
+                    }
+                }
+                else {
+                    throw `unexpected state, golangci-lint exited with 1, but provided no lint output`;
+                }
+            }
+            else if (exit_code > 1) {
+                throw `golangci-lint exit with code ${exit_code}`;
+            }
+        }
+        catch (e) {
+            return core.setFailed(`${e}`);
+        }
+        return core.info(`golangci-lint found no blocking issues`);
+    });
+}
 function runLint(lintPath, patchPath) {
     return __awaiter(this, void 0, void 0, function* () {
         const debug = core.getInput(`debug`);
@@ -6832,7 +6987,7 @@ function runLint(lintPath, patchPath) {
         if (userArgNames.has(`out-format`)) {
             throw new Error(`please, don't change out-format for golangci-lint: it can be broken in a future`);
         }
-        addedArgs.push(`--out-format=github-actions`);
+        addedArgs.push(`--out-format=json`);
         if (patchPath) {
             if (userArgNames.has(`new`) || userArgNames.has(`new-from-rev`) || userArgNames.has(`new-from-patch`)) {
                 throw new Error(`please, don't specify manually --new* args when requesting only new issues`);
@@ -6862,19 +7017,12 @@ function runLint(lintPath, patchPath) {
         const startedAt = Date.now();
         try {
             const res = yield execShellCommand(cmd, cmdArgs);
-            printOutput(res);
-            core.info(`golangci-lint found no issues`);
+            yield printOutput(res);
         }
         catch (exc) {
             // This logging passes issues to GitHub annotations but comments can be more convenient for some users.
             // TODO: support reviewdog or leaving comments by GitHub API.
-            printOutput(exc);
-            if (exc.code === 1) {
-                core.setFailed(`issues found`);
-            }
-            else {
-                core.setFailed(`golangci-lint exit with code ${exc.code}`);
-            }
+            yield printOutput(exc);
         }
         core.info(`Ran golangci-lint in ${Date.now() - startedAt}ms`);
     });
